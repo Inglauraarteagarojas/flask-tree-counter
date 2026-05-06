@@ -1,159 +1,542 @@
-
 """
 CONTADOR DE ÁRBOLES — UMNG Cajicá
 Flask + NumPy + SciPy | Detección + Modo Manual
 Laura Mercedes Arteaga Rojas — UMNG — Mayo 2026
 """
+
 import os
-import os,uuid,json,base64
+import uuid
+import json
+import base64
 from io import BytesIO
-from flask import Flask,render_template,request,jsonify,Response
+
+from flask import Flask, render_template, request, jsonify, Response
 import numpy as np
-from PIL import Image,ImageDraw
-from scipy.ndimage import (uniform_filter,label,find_objects,
-    binary_closing,binary_opening,binary_erosion,binary_dilation,
-    gaussian_filter,maximum_filter,distance_transform_edt)
+from PIL import Image, ImageDraw
+from scipy.ndimage import (
+    uniform_filter,
+    label,
+    find_objects,
+    binary_opening,
+    binary_erosion,
+    binary_dilation,
+    gaussian_filter,
+    maximum_filter,
+    distance_transform_edt,
+)
 
-app=Flask(__name__)
-app.config['UPLOAD_FOLDER']=os.path.join(os.path.dirname(__file__),'static','uploads')
-app.config['RESULTS_FOLDER']=os.path.join(os.path.dirname(__file__),'static','results')
-app.config['MAX_CONTENT_LENGTH']=300*1024*1024
-ALLOWED={'png','jpg','jpeg','tif','tiff','bmp'}
-os.makedirs(app.config['UPLOAD_FOLDER'],exist_ok=True)
-os.makedirs(app.config['RESULTS_FOLDER'],exist_ok=True)
+app = Flask(__name__)
 
-def allowed_file(fn):
-    return '.' in fn and fn.rsplit('.',1)[1].lower() in ALLOWED
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def detect_trees(path,params=None):
-    p=dict(max_dim=2200,hue_min=35,hue_max=170,sat_min=8,val_max=62,exg_min=4,
-           texture_thr=4,erosion_iter=1,peak_spacing=22,min_radius=4,gauss_sigma=2)
+app.config["UPLOAD_FOLDER"] = os.path.join(BASE_DIR, "static", "uploads")
+app.config["RESULTS_FOLDER"] = os.path.join(BASE_DIR, "static", "results")
+app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
+
+ALLOWED = {"png", "jpg", "jpeg", "tif", "tiff", "bmp"}
+
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+os.makedirs(app.config["RESULTS_FOLDER"], exist_ok=True)
+
+
+def allowed_file(filename):
+    """Valida extensiones permitidas."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED
+
+
+def detect_trees(path, params=None):
+    """
+    Detecta árboles/coberturas arbóreas usando:
+    - HSV aproximado
+    - índice ExG
+    - textura local
+    - distancia euclidiana para separar copas
+    """
+
+    p = dict(
+        max_dim=2200,
+        hue_min=35,
+        hue_max=170,
+        sat_min=8,
+        val_max=62,
+        exg_min=4,
+        texture_thr=4,
+        erosion_iter=1,
+        peak_spacing=22,
+        min_radius=4,
+        gauss_sigma=2,
+    )
+
     if params:
-        for k,v in params.items():
-            if k in p:p[k]=type(p[k])(v)
-    img=Image.open(path).convert('RGB');ow,oh=img.size;scale=1.0
-    if max(ow,oh)>p['max_dim']:
-        scale=p['max_dim']/max(ow,oh);img=img.resize((int(ow*scale),int(oh*scale)),Image.LANCZOS)
-    arr=np.array(img).astype(float);h,w=arr.shape[:2]
-    r,g,b=arr[:,:,0],arr[:,:,1],arr[:,:,2]
-    exg=2*g-r-b;mx=np.maximum(np.maximum(r,g),b);delta=mx-np.minimum(np.minimum(r,g),b)
-    with np.errstate(invalid='ignore',divide='ignore'):sat=np.where(mx>0,(delta/mx)*100,0)
-    val=(mx/255)*100;hue=np.zeros_like(r)
-    mr=(mx==r)&(delta>0);mg=(mx==g)&(delta>0)&~mr;mb=(mx==b)&(delta>0)&~mr&~mg
-    with np.errstate(invalid='ignore',divide='ignore'):
-        hue[mr]=60*(((g[mr]-b[mr])/delta[mr])%6);hue[mg]=60*((b[mg]-r[mg])/delta[mg]+2);hue[mb]=60*((r[mb]-g[mb])/delta[mb]+4)
-    hue[hue<0]+=360
-    gm=uniform_filter(g,size=7);gs=np.sqrt(np.maximum(uniform_filter(g*g,size=7)-gm**2,0))
-    cm=((hue>=p['hue_min'])&(hue<=p['hue_max'])&(sat>=p['sat_min'])&(val>=5)&(val<=p['val_max'])&
-        (exg>=p['exg_min'])&(g>r*0.8)&(g>b*0.95)&(gs>p['texture_thr']))
-    # El césped suele ser homogéneo: mucho brillo y poca textura.
-    # Se elimina para dejar preferiblemente copas con textura/sombra.
-    grass=(val>46)&(gs<4.2)&(sat<38);cm=cm&~grass
-    ce=binary_erosion(cm,structure=np.ones((3,3)),iterations=p['erosion_iter'])
-    ce=binary_opening(ce,structure=np.ones((3,3)),iterations=1)
-    ce=binary_dilation(ce,structure=np.ones((2,2)),iterations=1)
-    dist=distance_transform_edt(ce);ds=gaussian_filter(dist,sigma=p['gauss_sigma'])
-    lm=maximum_filter(ds,size=p['peak_spacing']);peaks=(ds==lm)&(ds>=max(2.0,p['min_radius']*0.45))
-    pl,_=label(peaks);ps=find_objects(pl)
-    trees=[]
-    for i,sl in enumerate(ps):
-        if sl is None:continue
-        pk=pl[sl]==(i+1);pys,pxs=np.where(pk)
-        pcy=int(sl[0].start+pys.mean());pcx=int(sl[1].start+pxs.mean())
-        radii=[]
-        for ai in range(16):
-            ang=2*np.pi*ai/16;bd=0
-            for d in range(2,55):
-                px=int(round(pcx+np.cos(ang)*d));py=int(round(pcy+np.sin(ang)*d))
-                if 0<=px<w and 0<=py<h and cm[py,px]:bd=d
-                elif d>bd+3:break
-            radii.append(bd)
-        if not radii:continue
-        mr_=float(np.median(radii))
-        if mr_<p['min_radius']:continue
-        br=mr_*1.15;bx0=max(0,int(pcx-br));by0=max(0,int(pcy-br))
-        bx1=min(w-1,int(pcx+br));by1=min(h-1,int(pcy+br))
-        bw_=bx1-bx0;bh_=by1-by0
-        if bw_<6 or bh_<6:continue
-        mi=cm[by0:by1,bx0:bx1];fill=mi.sum()/max(1,bw_*bh_)
-        if fill<0.06:continue
-        me=float(exg[by0:by1,bx0:bx1][mi].mean()) if mi.sum()>0 else 0
-        ms_=float(sat[by0:by1,bx0:bx1][mi].mean()) if mi.sum()>0 else 0
-        health='Healthy' if me>12 and ms_>16 else ('Moderate' if me>4 else 'Dry')
-        trees.append(dict(cx=pcx,cy=pcy,x0=bx0,y0=by0,x1=bx1,y1=by1,
-                         radius=round(mr_,1),exg=round(me,1),health=health,source='auto'))
-    ts=sorted(trees,key=lambda t:t['radius'],reverse=True);keep=[]
-    for t in ts:
-        ok=True
-        for k in keep:
-            ix0=max(t['x0'],k['x0']);iy0=max(t['y0'],k['y0']);ix1=min(t['x1'],k['x1']);iy1=min(t['y1'],k['y1'])
-            if ix0<ix1 and iy0<iy1:
-                inter=(ix1-ix0)*(iy1-iy0);a1=(t['x1']-t['x0'])*(t['y1']-t['y0']);a2=(k['x1']-k['x0'])*(k['y1']-k['y0'])
-                if inter/(a1+a2-inter)>0.2:ok=False;break
-        if ok:keep.append(t)
-    trees=keep;trees.sort(key=lambda t:(t['cy']//35,t['cx']))
-    for i,t in enumerate(trees):t['id']=i+1;t['label']=f"a{i+1}"
-    result=draw_det(img,trees)
-    hc={};
-    for t in trees:hc[t['health']]=hc.get(t['health'],0)+1
-    stats=dict(original_size=f"{ow}x{oh}",processed_size=f"{w}x{h}",scale=round(scale*100,1),
-               total=len(trees),healthy=hc.get('Healthy',0),moderate=hc.get('Moderate',0),dry=hc.get('Dry',0),params=p)
-    return trees,result,stats
+        for key, value in params.items():
+            if key in p:
+                p[key] = type(p[key])(value)
 
-def draw_det(img,trees):
-    r=img.copy();d=ImageDraw.Draw(r,'RGBA')
-    C={'Healthy':(102,255,51),'Moderate':(255,215,0),'Dry':(255,51,51)}
-    for t in trees:
-        c=C.get(t['health'],C['Healthy']);x0,y0,x1,y1=t['x0'],t['y0'],t['x1'],t['y1']
-        d.rectangle([x0,y0,x1,y1],outline=c,width=2)
-        hs=5
-        for hx,hy in [(x0,y0),(x1,y0),(x0,y1),(x1,y1),((x0+x1)//2,y0),((x0+x1)//2,y1),(x0,(y0+y1)//2),(x1,(y0+y1)//2)]:
-            d.rectangle([hx-hs//2,hy-hs//2,hx+hs//2,hy+hs//2],fill=(255,255,255),outline=c)
-        cl=min(8,(x1-x0)//3)
-        d.line([(t['cx']-cl,t['cy']),(t['cx']+cl,t['cy'])],fill=(255,34,34),width=1)
-        d.line([(t['cx'],t['cy']-cl),(t['cx'],t['cy']+cl)],fill=(255,34,34),width=1)
-        txt=f"{t['label']} {t['health']}";bb=d.textbbox((0,0),txt);tw=bb[2]-bb[0];th=bb[3]-bb[1]
-        tc=(0,0,0) if t['health']!='Dry' else (255,255,255)
-        d.rectangle([x0,y0-th-6,x0+tw+8,y0-1],fill=c+(220,))
-        d.text((x0+4,y0-th-4),txt,fill=tc)
-    return r
+    img = Image.open(path).convert("RGB")
+    original_width, original_height = img.size
+    scale = 1.0
 
-def to_b64(im):buf=BytesIO();im.save(buf,format='JPEG',quality=85);return base64.b64encode(buf.getvalue()).decode()
+    if max(original_width, original_height) > p["max_dim"]:
+        scale = p["max_dim"] / max(original_width, original_height)
+        img = img.resize(
+            (int(original_width * scale), int(original_height * scale)),
+            Image.LANCZOS,
+        )
 
-@app.route('/')
-def index():return render_template('index.html')
+    arr = np.array(img).astype(float)
+    height, width = arr.shape[:2]
 
-@app.route('/upload',methods=['POST'])
+    r = arr[:, :, 0]
+    g = arr[:, :, 1]
+    b = arr[:, :, 2]
+
+    # Índice Excess Green
+    exg = 2 * g - r - b
+
+    max_rgb = np.maximum(np.maximum(r, g), b)
+    min_rgb = np.minimum(np.minimum(r, g), b)
+    delta = max_rgb - min_rgb
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sat = np.where(max_rgb > 0, (delta / max_rgb) * 100, 0)
+
+    val = (max_rgb / 255) * 100
+    hue = np.zeros_like(r)
+
+    mask_r = (max_rgb == r) & (delta > 0)
+    mask_g = (max_rgb == g) & (delta > 0) & ~mask_r
+    mask_b = (max_rgb == b) & (delta > 0) & ~mask_r & ~mask_g
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        hue[mask_r] = 60 * (((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6)
+        hue[mask_g] = 60 * ((b[mask_g] - r[mask_g]) / delta[mask_g] + 2)
+        hue[mask_b] = 60 * ((r[mask_b] - g[mask_b]) / delta[mask_b] + 4)
+
+    hue[hue < 0] += 360
+
+    # Textura local sobre canal verde
+    green_mean = uniform_filter(g, size=7)
+    green_std = np.sqrt(
+        np.maximum(uniform_filter(g * g, size=7) - green_mean**2, 0)
+    )
+
+    # Máscara candidata de vegetación arbórea
+    candidate_mask = (
+        (hue >= p["hue_min"])
+        & (hue <= p["hue_max"])
+        & (sat >= p["sat_min"])
+        & (val >= 5)
+        & (val <= p["val_max"])
+        & (exg >= p["exg_min"])
+        & (g > r * 0.8)
+        & (g > b * 0.95)
+        & (green_std > p["texture_thr"])
+    )
+
+    # El césped suele ser más homogéneo.
+    # Este filtro ayuda a reducir falsos positivos sobre pasto.
+    grass_mask = (val > 46) & (green_std < 4.2) & (sat < 38)
+    candidate_mask = candidate_mask & ~grass_mask
+
+    clean_mask = binary_erosion(
+        candidate_mask,
+        structure=np.ones((3, 3)),
+        iterations=p["erosion_iter"],
+    )
+    clean_mask = binary_opening(
+        clean_mask,
+        structure=np.ones((3, 3)),
+        iterations=1,
+    )
+    clean_mask = binary_dilation(
+        clean_mask,
+        structure=np.ones((2, 2)),
+        iterations=1,
+    )
+
+    dist = distance_transform_edt(clean_mask)
+    dist_smooth = gaussian_filter(dist, sigma=p["gauss_sigma"])
+
+    local_max = maximum_filter(dist_smooth, size=p["peak_spacing"])
+    peaks = (dist_smooth == local_max) & (
+        dist_smooth >= max(2.0, p["min_radius"] * 0.45)
+    )
+
+    peak_labels, _ = label(peaks)
+    peak_slices = find_objects(peak_labels)
+
+    trees = []
+
+    for idx, peak_slice in enumerate(peak_slices):
+        if peak_slice is None:
+            continue
+
+        peak_mask = peak_labels[peak_slice] == (idx + 1)
+        peak_y, peak_x = np.where(peak_mask)
+
+        center_y = int(peak_slice[0].start + peak_y.mean())
+        center_x = int(peak_slice[1].start + peak_x.mean())
+
+        radii = []
+
+        for angle_index in range(16):
+            angle = 2 * np.pi * angle_index / 16
+            border_distance = 0
+
+            for distance in range(2, 55):
+                px = int(round(center_x + np.cos(angle) * distance))
+                py = int(round(center_y + np.sin(angle) * distance))
+
+                if 0 <= px < width and 0 <= py < height and candidate_mask[py, px]:
+                    border_distance = distance
+                elif distance > border_distance + 3:
+                    break
+
+            radii.append(border_distance)
+
+        if not radii:
+            continue
+
+        median_radius = float(np.median(radii))
+
+        if median_radius < p["min_radius"]:
+            continue
+
+        box_radius = median_radius * 1.15
+
+        x0 = max(0, int(center_x - box_radius))
+        y0 = max(0, int(center_y - box_radius))
+        x1 = min(width - 1, int(center_x + box_radius))
+        y1 = min(height - 1, int(center_y + box_radius))
+
+        box_width = x1 - x0
+        box_height = y1 - y0
+
+        if box_width < 6 or box_height < 6:
+            continue
+
+        mask_inside = candidate_mask[y0:y1, x0:x1]
+        fill_ratio = mask_inside.sum() / max(1, box_width * box_height)
+
+        if fill_ratio < 0.06:
+            continue
+
+        mean_exg = (
+            float(exg[y0:y1, x0:x1][mask_inside].mean())
+            if mask_inside.sum() > 0
+            else 0
+        )
+        mean_sat = (
+            float(sat[y0:y1, x0:x1][mask_inside].mean())
+            if mask_inside.sum() > 0
+            else 0
+        )
+
+        if mean_exg > 12 and mean_sat > 16:
+            health = "Healthy"
+        elif mean_exg > 4:
+            health = "Moderate"
+        else:
+            health = "Dry"
+
+        trees.append(
+            dict(
+                cx=center_x,
+                cy=center_y,
+                x0=x0,
+                y0=y0,
+                x1=x1,
+                y1=y1,
+                radius=round(median_radius, 1),
+                exg=round(mean_exg, 1),
+                health=health,
+                source="auto",
+            )
+        )
+
+    # Eliminar detecciones muy solapadas
+    sorted_trees = sorted(trees, key=lambda tree: tree["radius"], reverse=True)
+    keep = []
+
+    for tree in sorted_trees:
+        valid = True
+
+        for selected in keep:
+            ix0 = max(tree["x0"], selected["x0"])
+            iy0 = max(tree["y0"], selected["y0"])
+            ix1 = min(tree["x1"], selected["x1"])
+            iy1 = min(tree["y1"], selected["y1"])
+
+            if ix0 < ix1 and iy0 < iy1:
+                intersection = (ix1 - ix0) * (iy1 - iy0)
+                area_tree = (tree["x1"] - tree["x0"]) * (tree["y1"] - tree["y0"])
+                area_selected = (selected["x1"] - selected["x0"]) * (
+                    selected["y1"] - selected["y0"]
+                )
+                union = area_tree + area_selected - intersection
+                iou = intersection / union
+
+                if iou > 0.2:
+                    valid = False
+                    break
+
+        if valid:
+            keep.append(tree)
+
+    trees = keep
+    trees.sort(key=lambda tree: (tree["cy"] // 35, tree["cx"]))
+
+    for index, tree in enumerate(trees):
+        tree["id"] = index + 1
+        tree["label"] = f"a{index + 1}"
+
+    result_image = draw_detections(img, trees)
+
+    health_count = {}
+    for tree in trees:
+        health_count[tree["health"]] = health_count.get(tree["health"], 0) + 1
+
+    stats = dict(
+        original_size=f"{original_width}x{original_height}",
+        processed_size=f"{width}x{height}",
+        scale=round(scale * 100, 1),
+        total=len(trees),
+        healthy=health_count.get("Healthy", 0),
+        moderate=health_count.get("Moderate", 0),
+        dry=health_count.get("Dry", 0),
+        params=p,
+    )
+
+    return trees, result_image, stats
+
+
+def draw_detections(img, trees):
+    """Dibuja cajas, puntos centrales y etiquetas sobre la imagen."""
+    result = img.copy()
+    draw = ImageDraw.Draw(result, "RGBA")
+
+    colors = {
+        "Healthy": (102, 255, 51),
+        "Moderate": (255, 215, 0),
+        "Dry": (255, 51, 51),
+    }
+
+    for tree in trees:
+        color = colors.get(tree["health"], colors["Healthy"])
+
+        x0 = tree["x0"]
+        y0 = tree["y0"]
+        x1 = tree["x1"]
+        y1 = tree["y1"]
+
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+
+        handle_size = 5
+        handle_points = [
+            (x0, y0),
+            (x1, y0),
+            (x0, y1),
+            (x1, y1),
+            ((x0 + x1) // 2, y0),
+            ((x0 + x1) // 2, y1),
+            (x0, (y0 + y1) // 2),
+            (x1, (y0 + y1) // 2),
+        ]
+
+        for handle_x, handle_y in handle_points:
+            draw.rectangle(
+                [
+                    handle_x - handle_size // 2,
+                    handle_y - handle_size // 2,
+                    handle_x + handle_size // 2,
+                    handle_y + handle_size // 2,
+                ],
+                fill=(255, 255, 255),
+                outline=color,
+            )
+
+        cross_size = min(8, (x1 - x0) // 3)
+
+        draw.line(
+            [
+                (tree["cx"] - cross_size, tree["cy"]),
+                (tree["cx"] + cross_size, tree["cy"]),
+            ],
+            fill=(255, 34, 34),
+            width=1,
+        )
+
+        draw.line(
+            [
+                (tree["cx"], tree["cy"] - cross_size),
+                (tree["cx"], tree["cy"] + cross_size),
+            ],
+            fill=(255, 34, 34),
+            width=1,
+        )
+
+        text = f"{tree['label']} {tree['health']}"
+        bbox = draw.textbbox((0, 0), text)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        text_color = (0, 0, 0) if tree["health"] != "Dry" else (255, 255, 255)
+
+        draw.rectangle(
+            [x0, y0 - text_height - 6, x0 + text_width + 8, y0 - 1],
+            fill=color + (220,),
+        )
+
+        draw.text(
+            (x0 + 4, y0 - text_height - 4),
+            text,
+            fill=text_color,
+        )
+
+    return result
+
+
+def image_to_base64(image):
+    """Convierte una imagen PIL a base64 para mostrarla en el navegador."""
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/upload", methods=["POST"])
 def upload():
-    if 'file' not in request.files:return jsonify(error='No file'),400
-    f=request.files['file']
-    if not f.filename or not allowed_file(f.filename):return jsonify(error='Formato no válido'),400
-    fid=str(uuid.uuid4())[:8];fp=os.path.join(app.config['UPLOAD_FOLDER'],f"{fid}.{f.filename.rsplit('.',1)[1].lower()}")
-    f.save(fp)
-    params={k:float(v) if '.' in v else int(v) for k in
-            ['peak_spacing','val_max','texture_thr','exg_min','erosion_iter','min_radius','gauss_sigma']
-            if (v:=request.form.get(k))}
-    try:trees,result,stats=detect_trees(fp,params)
-    except Exception as e:return jsonify(error=str(e)),500
-    result.save(os.path.join(app.config['RESULTS_FOLDER'],f"{fid}_result.jpg"),quality=90)
-    with open(os.path.join(app.config['RESULTS_FOLDER'],f"{fid}_trees.json"),'w') as jf:json.dump(dict(trees=trees,stats=stats),jf)
-    orig=Image.open(fp).convert('RGB')
-    if max(orig.size)>1800:sc=1800/max(orig.size);orig=orig.resize((int(orig.width*sc),int(orig.height*sc)),Image.LANCZOS)
-    return jsonify(ok=True,fid=fid,trees=trees,stats=stats,orig_b64=to_b64(orig),result_b64=to_b64(result))
+    """Recibe la imagen, ejecuta detección y retorna resultados al frontend."""
+    if "file" not in request.files:
+        return jsonify(error="No se recibió archivo"), 400
 
-@app.route('/csv/<fid>')
-def csv_dl(fid):
-    jp=os.path.join(app.config['RESULTS_FOLDER'],f"{fid}_trees.json")
-    if not os.path.exists(jp):return "Not found",404
-    with open(jp) as f:data=json.load(f)
-    rows=['ID,Label,Source,CentroX,CentroY,Radio,BboxW,BboxH,ExG,Health']
-    for t in data['trees']:
-        rows.append(f"{t['id']},{t['label']},{t.get('source','auto')},{t['cx']},{t['cy']},{t['radius']},"
-                     f"{t['x1']-t['x0']},{t['y1']-t['y0']},{t['exg']},{t['health']}")
-    return Response('\n'.join(rows),mimetype='text/csv',headers={'Content-Disposition':f'attachment;filename=arboles_{fid}.csv'})
+    file = request.files["file"]
 
+    if not file.filename or not allowed_file(file.filename):
+        return jsonify(error="Formato no válido"), 400
+
+    extension = file.filename.rsplit(".", 1)[1].lower()
+    file_id = str(uuid.uuid4())[:8]
+
+    file_path = os.path.join(
+        app.config["UPLOAD_FOLDER"],
+        f"{file_id}.{extension}",
+    )
+
+    file.save(file_path)
+
+    params = {}
+
+    for key in [
+        "peak_spacing",
+        "val_max",
+        "texture_thr",
+        "exg_min",
+        "erosion_iter",
+        "min_radius",
+        "gauss_sigma",
+    ]:
+        value = request.form.get(key)
+        if value:
+            params[key] = float(value) if "." in value else int(value)
+
+    try:
+        trees, result_image, stats = detect_trees(file_path, params)
+    except Exception as error:
+        return jsonify(error=str(error)), 500
+
+    result_path = os.path.join(
+        app.config["RESULTS_FOLDER"],
+        f"{file_id}_result.jpg",
+    )
+
+    json_path = os.path.join(
+        app.config["RESULTS_FOLDER"],
+        f"{file_id}_trees.json",
+    )
+
+    result_image.save(result_path, quality=90)
+
+    with open(json_path, "w", encoding="utf-8") as json_file:
+        json.dump(
+            dict(trees=trees, stats=stats),
+            json_file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    original_image = Image.open(file_path).convert("RGB")
+
+    if max(original_image.size) > 1800:
+        resize_scale = 1800 / max(original_image.size)
+        original_image = original_image.resize(
+            (
+                int(original_image.width * resize_scale),
+                int(original_image.height * resize_scale),
+            ),
+            Image.LANCZOS,
+        )
+
+    return jsonify(
+        ok=True,
+        fid=file_id,
+        trees=trees,
+        stats=stats,
+        orig_b64=image_to_base64(original_image),
+        result_b64=image_to_base64(result_image),
+    )
+
+
+@app.route("/csv/<file_id>")
+def download_csv(file_id):
+    """Descarga los resultados como CSV."""
+    json_path = os.path.join(
+        app.config["RESULTS_FOLDER"],
+        f"{file_id}_trees.json",
+    )
+
+    if not os.path.exists(json_path):
+        return "Not found", 404
+
+    with open(json_path, encoding="utf-8") as json_file:
+        data = json.load(json_file)
+
+    rows = ["ID,Label,Source,CentroX,CentroY,Radio,BboxW,BboxH,ExG,Health"]
+
+    for tree in data["trees"]:
+        rows.append(
+            f"{tree['id']},"
+            f"{tree['label']},"
+            f"{tree.get('source', 'auto')},"
+            f"{tree['cx']},"
+            f"{tree['cy']},"
+            f"{tree['radius']},"
+            f"{tree['x1'] - tree['x0']},"
+            f"{tree['y1'] - tree['y0']},"
+            f"{tree['exg']},"
+            f"{tree['health']}"
+        )
+
+    return Response(
+        "\n".join(rows),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment;filename=arboles_{file_id}.csv"
+        },
+    )
+
+
+@app.route("/health")
+def health():
+    """Ruta simple para comprobar que la app está viva en Render."""
+    return jsonify(status="ok")
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host="0.0.0.0", port=port)
+    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug_mode, host="0.0.0.0", port=port)
