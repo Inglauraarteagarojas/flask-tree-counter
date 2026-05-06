@@ -4,7 +4,7 @@ CONTADOR DE ÁRBOLES — UMNG Cajicá
 Flask + NumPy + SciPy | Detección + Modo Manual
 Laura Mercedes Arteaga Rojas — UMNG — Mayo 2026
 """
-
+import os
 import os,uuid,json,base64
 from io import BytesIO
 from flask import Flask,render_template,request,jsonify,Response
@@ -151,6 +151,8 @@ def csv_dl(fid):
         rows.append(f"{t['id']},{t['label']},{t.get('source','auto')},{t['cx']},{t['cy']},{t['radius']},"
                      f"{t['x1']-t['x0']},{t['y1']-t['y0']},{t['exg']},{t['health']}")
     return Response('\n'.join(rows),mimetype='text/csv',headers={'Content-Disposition':f'attachment;filename=arboles_{fid}.csv'})
+
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
