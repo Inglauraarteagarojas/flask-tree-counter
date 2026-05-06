@@ -1,6 +1,6 @@
 """
 CONTADOR DE ÁRBOLES — UMNG Cajicá
-Flask + NumPy + SciPy | Detección + Modo Manual
+Flask + NumPy + SciPy | Detección de copas de árboles
 Laura Mercedes Arteaga Rojas — UMNG — Mayo 2026
 """
 
@@ -13,6 +13,12 @@ from io import BytesIO
 from flask import Flask, render_template, request, jsonify, Response
 import numpy as np
 from PIL import Image, ImageDraw
+
+# Permitir ortofotos grandes de dron.
+# Esto corrige el error:
+# Image size exceeds limit ... could be decompression bomb DOS attack.
+Image.MAX_IMAGE_PIXELS = None
+
 from scipy.ndimage import (
     uniform_filter,
     label,
@@ -46,24 +52,24 @@ def allowed_file(filename):
 
 def detect_trees(path, params=None):
     """
-    Detecta árboles/coberturas arbóreas usando:
-    - HSV aproximado
-    - índice ExG
-    - textura local
-    - distancia euclidiana para separar copas
+    Detecta copas de árboles usando:
+    - Color verde aproximado.
+    - Índice ExG.
+    - Textura local.
+    - Separación de copas con transformada de distancia.
     """
 
     p = dict(
-        max_dim=2200,
+        max_dim=1600,
         hue_min=35,
         hue_max=170,
         sat_min=8,
-        val_max=62,
-        exg_min=4,
-        texture_thr=4,
+        val_max=72,
+        exg_min=3,
+        texture_thr=3,
         erosion_iter=1,
-        peak_spacing=22,
-        min_radius=4,
+        peak_spacing=14,
+        min_radius=3,
         gauss_sigma=2,
     )
 
@@ -76,6 +82,7 @@ def detect_trees(path, params=None):
     original_width, original_height = img.size
     scale = 1.0
 
+    # Reducir imagen grande para que Render no se quede sin memoria.
     if max(original_width, original_height) > p["max_dim"]:
         scale = p["max_dim"] / max(original_width, original_height)
         img = img.resize(
@@ -90,7 +97,7 @@ def detect_trees(path, params=None):
     g = arr[:, :, 1]
     b = arr[:, :, 2]
 
-    # Índice Excess Green
+    # Índice Excess Green.
     exg = 2 * g - r - b
 
     max_rgb = np.maximum(np.maximum(r, g), b)
@@ -114,13 +121,13 @@ def detect_trees(path, params=None):
 
     hue[hue < 0] += 360
 
-    # Textura local sobre canal verde
+    # Textura local sobre canal verde.
     green_mean = uniform_filter(g, size=7)
     green_std = np.sqrt(
         np.maximum(uniform_filter(g * g, size=7) - green_mean**2, 0)
     )
 
-    # Máscara candidata de vegetación arbórea
+    # Máscara candidata de vegetación.
     candidate_mask = (
         (hue >= p["hue_min"])
         & (hue <= p["hue_max"])
@@ -133,9 +140,8 @@ def detect_trees(path, params=None):
         & (green_std > p["texture_thr"])
     )
 
-    # El césped suele ser más homogéneo.
-    # Este filtro ayuda a reducir falsos positivos sobre pasto.
-    grass_mask = (val > 46) & (green_std < 4.2) & (sat < 38)
+    # Filtro para reducir falsos positivos de césped o suelo verdoso homogéneo.
+    grass_mask = (val > 48) & (green_std < 3.5) & (sat < 35)
     candidate_mask = candidate_mask & ~grass_mask
 
     clean_mask = binary_erosion(
@@ -143,17 +149,20 @@ def detect_trees(path, params=None):
         structure=np.ones((3, 3)),
         iterations=p["erosion_iter"],
     )
+
     clean_mask = binary_opening(
         clean_mask,
         structure=np.ones((3, 3)),
         iterations=1,
     )
+
     clean_mask = binary_dilation(
         clean_mask,
         structure=np.ones((2, 2)),
         iterations=1,
     )
 
+    # Separación de copas.
     dist = distance_transform_edt(clean_mask)
     dist_smooth = gaussian_filter(dist, sigma=p["gauss_sigma"])
 
@@ -173,6 +182,9 @@ def detect_trees(path, params=None):
 
         peak_mask = peak_labels[peak_slice] == (idx + 1)
         peak_y, peak_x = np.where(peak_mask)
+
+        if len(peak_y) == 0 or len(peak_x) == 0:
+            continue
 
         center_y = int(peak_slice[0].start + peak_y.mean())
         center_x = int(peak_slice[1].start + peak_x.mean())
@@ -202,7 +214,7 @@ def detect_trees(path, params=None):
         if median_radius < p["min_radius"]:
             continue
 
-        box_radius = median_radius * 1.15
+        box_radius = median_radius * 1.20
 
         x0 = max(0, int(center_x - box_radius))
         y0 = max(0, int(center_y - box_radius))
@@ -212,13 +224,13 @@ def detect_trees(path, params=None):
         box_width = x1 - x0
         box_height = y1 - y0
 
-        if box_width < 6 or box_height < 6:
+        if box_width < 5 or box_height < 5:
             continue
 
         mask_inside = candidate_mask[y0:y1, x0:x1]
         fill_ratio = mask_inside.sum() / max(1, box_width * box_height)
 
-        if fill_ratio < 0.06:
+        if fill_ratio < 0.05:
             continue
 
         mean_exg = (
@@ -226,6 +238,7 @@ def detect_trees(path, params=None):
             if mask_inside.sum() > 0
             else 0
         )
+
         mean_sat = (
             float(sat[y0:y1, x0:x1][mask_inside].mean())
             if mask_inside.sum() > 0
@@ -254,7 +267,7 @@ def detect_trees(path, params=None):
             )
         )
 
-    # Eliminar detecciones muy solapadas
+    # Eliminar detecciones demasiado solapadas.
     sorted_trees = sorted(trees, key=lambda tree: tree["radius"], reverse=True)
     keep = []
 
@@ -274,11 +287,12 @@ def detect_trees(path, params=None):
                     selected["y1"] - selected["y0"]
                 )
                 union = area_tree + area_selected - intersection
-                iou = intersection / union
 
-                if iou > 0.2:
-                    valid = False
-                    break
+                if union > 0:
+                    iou = intersection / union
+                    if iou > 0.2:
+                        valid = False
+                        break
 
         if valid:
             keep.append(tree)
@@ -293,6 +307,7 @@ def detect_trees(path, params=None):
     result_image = draw_detections(img, trees)
 
     health_count = {}
+
     for tree in trees:
         health_count[tree["health"]] = health_count.get(tree["health"], 0) + 1
 
@@ -355,7 +370,7 @@ def draw_detections(img, trees):
                 outline=color,
             )
 
-        cross_size = min(8, (x1 - x0) // 3)
+        cross_size = min(8, max(3, (x1 - x0) // 3))
 
         draw.line(
             [
@@ -382,13 +397,16 @@ def draw_detections(img, trees):
 
         text_color = (0, 0, 0) if tree["health"] != "Dry" else (255, 255, 255)
 
+        label_y0 = max(0, y0 - text_height - 6)
+        label_y1 = max(text_height + 4, y0 - 1)
+
         draw.rectangle(
-            [x0, y0 - text_height - 6, x0 + text_width + 8, y0 - 1],
+            [x0, label_y0, x0 + text_width + 8, label_y1],
             fill=color + (220,),
         )
 
         draw.text(
-            (x0 + 4, y0 - text_height - 4),
+            (x0 + 4, label_y0 + 2),
             text,
             fill=text_color,
         )
@@ -441,6 +459,7 @@ def upload():
         "gauss_sigma",
     ]:
         value = request.form.get(key)
+
         if value:
             params[key] = float(value) if "." in value else int(value)
 
@@ -469,6 +488,7 @@ def upload():
             indent=2,
         )
 
+    # Imagen original reducida para previsualización.
     original_image = Image.open(file_path).convert("RGB")
 
     if max(original_image.size) > 1800:
