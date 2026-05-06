@@ -1,5 +1,5 @@
-Flask
-opencv-python-headless
-numpy
-Pillow
-gunicorn
+Flask==3.0.3
+numpy==1.26.4
+Pillow==10.4.0
+scipy==1.13.1
+gunicorn==22.0.0
